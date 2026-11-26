@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -238,23 +239,99 @@ func TestStats_Success(t *testing.T) {
 
 func TestAck_Success(t *testing.T) {
 	h, store := newTestHandler(t)
-	_ = enqueueMessage(t, store, "orders", "to-ack")
+	id := enqueueMessage(t, store, "orders", "to-ack")
 
-	// Dequeue first so the message is in-flight.
-	_, _ = store.Dequeue(context.Background(), "orders", 1)
+	// Pull through the API so the response carries the lease_id required to
+	// acknowledge a leased message.
+	req := httptest.NewRequest(http.MethodGet, "/queues/orders/messages/next", nil)
+	req.SetPathValue("name", "orders")
+	w := httptest.NewRecorder()
+	h.consume(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("consume status = %d, body: %s", w.Code, w.Body.String())
+	}
+	var claimed storage.Message
+	if err := json.NewDecoder(w.Body).Decode(&claimed); err != nil {
+		t.Fatalf("decode consumed: %v", err)
+	}
+	if claimed.ID != id || claimed.LeaseID == "" {
+		t.Fatalf("consumed = %+v, want id %q with a lease token", claimed, id)
+	}
 
-	// Actually, memory storage removes on Dequeue. Re-enqueue for ack test.
-	id := enqueueMessage(t, store, "orders", "to-ack-2")
+	ackReq := httptest.NewRequest(http.MethodDelete,
+		"/queues/orders/messages/"+id+"?lease_id="+claimed.LeaseID, nil)
+	ackReq.SetPathValue("name", "orders")
+	ackReq.SetPathValue("id", id)
+	ackW := httptest.NewRecorder()
 
-	req := httptest.NewRequest(http.MethodDelete, "/queues/orders/messages/{id}", nil)
+	h.ack(ackW, ackReq)
+
+	if ackW.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body: %s", ackW.Code, http.StatusOK, ackW.Body.String())
+	}
+}
+
+func TestAck_MissingLeaseRejected(t *testing.T) {
+	h, store := newTestHandler(t)
+	id := enqueueMessage(t, store, "orders", "leased")
+
+	msgs, err := store.(storage.VisibilityStorage).DequeueClaimed(
+		context.Background(), "orders", 1, time.Minute)
+	if err != nil {
+		t.Fatalf("DequeueClaimed: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodDelete, "/queues/orders/messages/"+id, nil)
 	req.SetPathValue("name", "orders")
 	req.SetPathValue("id", id)
 	w := httptest.NewRecorder()
-
 	h.ack(w, req)
 
-	if w.Code != http.StatusOK {
-		t.Fatalf("status = %d, want %d; body: %s", w.Code, http.StatusOK, w.Body.String())
+	if w.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want %d; body: %s", w.Code, http.StatusConflict, w.Body.String())
+	}
+	// The claim must still be held: a correct lease ack still succeeds.
+	if err := store.(storage.VisibilityStorage).AckClaimed(
+		context.Background(), "orders", msgs[0].ID, msgs[0].LeaseID); err != nil {
+		t.Fatalf("AckClaimed after rejected ack: %v", err)
+	}
+}
+
+func TestAck_StaleLeaseRejectedAndNewClaimSurvives(t *testing.T) {
+	h, store := newTestHandler(t)
+	leased := store.(storage.VisibilityStorage)
+	id := enqueueMessage(t, store, "orders", "re-claimed")
+
+	first, err := leased.DequeueClaimed(context.Background(), "orders", 1, 20*time.Millisecond)
+	if err != nil {
+		t.Fatalf("first DequeueClaimed: %v", err)
+	}
+	time.Sleep(30 * time.Millisecond)
+	second, err := leased.DequeueClaimed(context.Background(), "orders", 1, time.Minute)
+	if err != nil {
+		t.Fatalf("second DequeueClaimed: %v", err)
+	}
+	if second[0].LeaseID == first[0].LeaseID {
+		t.Fatal("re-claim returned the same lease id")
+	}
+
+	// The first worker's late ack must be rejected and leave the new claim.
+	req := httptest.NewRequest(http.MethodDelete,
+		"/queues/orders/messages/"+id+"?lease_id="+first[0].LeaseID, nil)
+	req.SetPathValue("name", "orders")
+	req.SetPathValue("id", id)
+	w := httptest.NewRecorder()
+	h.ack(w, req)
+	if w.Code != http.StatusConflict {
+		t.Fatalf("stale ack status = %d, want %d", w.Code, http.StatusConflict)
+	}
+
+	// The current claim acks normally — exactly once.
+	if err := leased.AckClaimed(context.Background(), "orders", id, second[0].LeaseID); err != nil {
+		t.Fatalf("current AckClaimed: %v", err)
+	}
+	if err := leased.AckClaimed(context.Background(), "orders", id, second[0].LeaseID); !errors.Is(err, storage.ErrLeaseLost) {
+		t.Fatalf("second ack = %v, want ErrLeaseLost", err)
 	}
 }
 

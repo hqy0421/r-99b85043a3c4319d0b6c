@@ -105,12 +105,12 @@ func NewPostgres(ctx context.Context, dsn string, schemas ...string) (*Postgres,
 		return nil, fmt.Errorf("shoebox/postgres: init schema: %w", err)
 	}
 
-	// Reclaim stale in-flight messages from a previous crash (same as SQLite).
-	if _, err := pool.Exec(ctx,
-		`UPDATE shoebox_messages SET status = 'pending' WHERE status = 'processing'`); err != nil {
-		pool.Close()
-		return nil, fmt.Errorf("shoebox/postgres: reclaim: %w", err)
-	}
+	// No blanket reclaim on open. 'processing' rows keep their persisted
+	// lease_expires_at; Dequeue re-claims them only once that original
+	// deadline passes, so restart preserves the visibility boundary instead
+	// of resetting every in-flight claim. Rows written by builds predating
+	// leases carry lease_expires_at = NULL, which never satisfies
+	// lease_expires_at > now() and is therefore immediately re-claimable.
 
 	return &Postgres{pool: pool, schema: schema}, nil
 }
@@ -353,8 +353,8 @@ func enqueuePostgresAtomic(
 }
 
 const postgresInsertStatement = `INSERT INTO shoebox_messages
-	(id, queue, payload, attempts, max_retries, created_at, scheduled_at, priority, dedupe_key, metadata, error, dead_at, status)
-	VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)`
+	(id, queue, payload, attempts, max_retries, created_at, scheduled_at, priority, dedupe_key, metadata, error, dead_at, status, lease_id, lease_expires_at)
+	VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)`
 
 const postgresDedupeInsertStatement = postgresInsertStatement + `
 	ON CONFLICT (queue, dedupe_key)
@@ -403,6 +403,14 @@ func postgresEnqueueArgs(queue string, msg Message) ([]any, error) {
 	if !msg.DeadAt.IsZero() {
 		deadAt = msg.DeadAt
 	}
+	// Freshly enqueued (including retry/replay) messages hold no claim: the
+	// next Dequeue assigns their first LeaseID and deadline. Send a nil
+	// timestamp for the zero deadline rather than the column default, so the
+	// intent is explicit across driver versions.
+	var leaseExpiresAt any
+	if !msg.LeaseExpiresAt.IsZero() {
+		leaseExpiresAt = msg.LeaseExpiresAt.UTC()
+	}
 	status := "pending"
 	if strings.HasSuffix(queue, ".dlq") {
 		status = "dead"
@@ -410,14 +418,33 @@ func postgresEnqueueArgs(queue string, msg Message) ([]any, error) {
 	return []any{
 		msg.ID, queue, payload, msg.Attempts, msg.MaxRetries,
 		msg.CreatedAt, msg.ScheduledAt, msg.Priority, msg.DedupeKey, meta, msg.Error, deadAt, status,
+		msg.LeaseID, leaseExpiresAt,
 	}, nil
 }
 
+// defaultPostgresVisibility is the lease duration used by the plain
+// (non-lease-aware) Dequeue shim. Long enough that direct Storage callers
+// see effectively unbounded claims; the broker drives DequeueClaimed with
+// its own configured visibility timeout.
+const defaultPostgresVisibility = 24 * time.Hour
+
 // Dequeue uses SELECT … FOR UPDATE SKIP LOCKED to atomically claim up to
-// `limit` due messages. This allows multiple consumer processes to pull from
-// the same queue without double-delivery (E2-S4): each consumer locks its
-// rows, so no two consumers ever see the same message.
+// `limit` due messages. It is the non-lease-aware shim over
+// DequeueClaimed with a long default visibility timeout.
 func (p *Postgres) Dequeue(ctx context.Context, queue string, limit int) ([]Message, error) {
+	return p.DequeueClaimed(ctx, queue, limit, defaultPostgresVisibility)
+}
+
+// DequeueClaimed claims up to `limit` deliverable messages using
+// SELECT … FOR UPDATE SKIP LOCKED. Eligible rows are due 'pending' messages
+// and 'processing' messages whose lease has expired, so multiple consumer
+// processes share the queue without double-delivery and a crashed worker's
+// timed-out claim is handed to another worker without a restart.
+//
+// Every claimed row receives a freshly generated lease_id fencing token and
+// lease_expires_at = now + visibilityTimeout. A late ack carrying the
+// previous token cannot affect the new claim.
+func (p *Postgres) DequeueClaimed(ctx context.Context, queue string, limit int, visibilityTimeout time.Duration) ([]Message, error) {
 	tx, err := p.pool.Begin(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("shoebox/postgres: dequeue begin: %w", err)
@@ -425,9 +452,13 @@ func (p *Postgres) Dequeue(ctx context.Context, queue string, limit int) ([]Mess
 	defer func() { _ = tx.Rollback(ctx) }()
 
 	rows, err := tx.Query(ctx,
-		`SELECT id, payload, attempts, max_retries, created_at, scheduled_at, dedupe_key, metadata, error, dead_at, priority
+		`SELECT id, payload, attempts, max_retries, created_at, scheduled_at, dedupe_key, metadata, error, dead_at, priority, lease_id, lease_expires_at
 		 FROM shoebox_messages
-		 WHERE queue = $1 AND status = 'pending' AND scheduled_at <= now()
+		 WHERE queue = $1
+		   AND (
+		     (status = 'pending' AND scheduled_at <= now())
+		     OR (status = 'processing' AND lease_expires_at <= now())
+		   )
 		 ORDER BY priority DESC, created_at ASC
 		 LIMIT $2
 		 FOR UPDATE SKIP LOCKED`,
@@ -455,12 +486,19 @@ func (p *Postgres) Dequeue(ctx context.Context, queue string, limit int) ([]Mess
 		return nil, ErrEmpty
 	}
 
+	deadline := time.Now().Add(visibilityTimeout).UTC()
 	for i := range msgs {
+		leaseID := NewLeaseID()
 		if _, err := tx.Exec(ctx,
-			`UPDATE shoebox_messages SET status = 'processing' WHERE id = $1 AND queue = $2`,
-			msgs[i].ID, queue); err != nil {
+			`UPDATE shoebox_messages
+			 SET status = 'processing', lease_id = $3, lease_expires_at = $4
+			 WHERE id = $1 AND queue = $2
+			   AND (status = 'pending' OR (status = 'processing' AND lease_expires_at <= now()))`,
+			msgs[i].ID, queue, leaseID, deadline); err != nil {
 			return nil, fmt.Errorf("shoebox/postgres: dequeue mark processing: %w", err)
 		}
+		msgs[i].LeaseID = leaseID
+		msgs[i].LeaseExpiresAt = deadline
 	}
 
 	if err := tx.Commit(ctx); err != nil {
@@ -470,19 +508,39 @@ func (p *Postgres) Dequeue(ctx context.Context, queue string, limit int) ([]Mess
 }
 
 // Ack removes a successfully processed message and bumps the processed counter.
+// Non-lease-aware shim: any processing row with the ID is removed.
 func (p *Postgres) Ack(ctx context.Context, queue, msgID string) error {
+	return p.ack(ctx, queue, msgID, "", false)
+}
+
+// AckClaimed removes the message only when leaseID is the row's current
+// fencing token. A stale token returns ErrLeaseLost without touching the
+// newer claim or the completed state.
+func (p *Postgres) AckClaimed(ctx context.Context, queue, msgID, leaseID string) error {
+	return p.ack(ctx, queue, msgID, leaseID, true)
+}
+
+func (p *Postgres) ack(ctx context.Context, queue, msgID, leaseID string, fenced bool) error {
 	tx, err := p.pool.Begin(ctx)
 	if err != nil {
 		return fmt.Errorf("shoebox/postgres: ack begin: %w", err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
-	tag, err := tx.Exec(ctx,
-		`DELETE FROM shoebox_messages WHERE id = $1 AND queue = $2 AND status = 'processing'`, msgID, queue)
+	query := `DELETE FROM shoebox_messages WHERE id = $1 AND queue = $2 AND status = 'processing'`
+	args := []any{msgID, queue}
+	if fenced {
+		query += ` AND lease_id = $3`
+		args = append(args, leaseID)
+	}
+	tag, err := tx.Exec(ctx, query, args...)
 	if err != nil {
 		return fmt.Errorf("shoebox/postgres: ack delete: %w", err)
 	}
 	if tag.RowsAffected() == 0 {
+		if fenced {
+			return ErrLeaseLost
+		}
 		return tx.Commit(ctx)
 	}
 	if _, err := tx.Exec(ctx,
@@ -498,7 +556,22 @@ func (p *Postgres) Ack(ctx context.Context, queue, msgID string) error {
 
 // AckBatch deletes processing messages and updates processed atomically.
 func (p *Postgres) AckBatch(ctx context.Context, queue string, msgIDs []string) error {
-	if len(msgIDs) == 0 {
+	claims := make([]Claim, len(msgIDs))
+	for i, id := range msgIDs {
+		claims[i] = Claim{MessageID: id}
+	}
+	return p.ackBatch(ctx, queue, claims, false)
+}
+
+// AckClaimedBatch deletes processing rows whose current lease_id matches the
+// claim. Non-matching claims are skipped without affecting the others, and
+// processed advances once per deleted row.
+func (p *Postgres) AckClaimedBatch(ctx context.Context, queue string, claims []Claim) error {
+	return p.ackBatch(ctx, queue, claims, true)
+}
+
+func (p *Postgres) ackBatch(ctx context.Context, queue string, claims []Claim, fenced bool) error {
+	if len(claims) == 0 {
 		return nil
 	}
 	tx, err := p.pool.Begin(ctx)
@@ -507,13 +580,20 @@ func (p *Postgres) AckBatch(ctx context.Context, queue string, msgIDs []string) 
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
-	tag, err := tx.Exec(ctx,
-		`DELETE FROM shoebox_messages WHERE queue = $1 AND status = 'processing' AND id = ANY($2)`,
-		queue, msgIDs)
-	if err != nil {
-		return fmt.Errorf("shoebox/postgres: ack batch delete: %w", err)
+	var processed int64
+	for i, claim := range claims {
+		query := `DELETE FROM shoebox_messages WHERE id = $1 AND queue = $2 AND status = 'processing'`
+		args := []any{claim.MessageID, queue}
+		if fenced {
+			query += ` AND lease_id = $3`
+			args = append(args, claim.LeaseID)
+		}
+		tag, err := tx.Exec(ctx, query, args...)
+		if err != nil {
+			return fmt.Errorf("shoebox/postgres: ack batch delete %d: %w", i, err)
+		}
+		processed += tag.RowsAffected()
 	}
-	processed := tag.RowsAffected()
 	if processed > 0 {
 		if _, err := tx.Exec(ctx,
 			`INSERT INTO shoebox_stats (queue, processed, errors, retries, dead)
@@ -529,21 +609,44 @@ func (p *Postgres) AckBatch(ctx context.Context, queue string, msgIDs []string) 
 
 // Retry records the failed delivery and persists the updated message for a
 // future delivery in one transaction.
-func (p *Postgres) Retry(ctx context.Context, queue string, msg Message, _ error) error {
+func (p *Postgres) Retry(ctx context.Context, queue string, msg Message, err error) error {
+	return p.retry(ctx, queue, msg, err, false)
+}
+
+// RetryClaimed records the failure only when msg.LeaseID is the row's current
+// fencing token; a stale claimant gets ErrLeaseLost and the newer claim keeps
+// running.
+func (p *Postgres) RetryClaimed(ctx context.Context, queue string, msg Message, err error) error {
+	return p.retry(ctx, queue, msg, err, true)
+}
+
+func (p *Postgres) retry(ctx context.Context, queue string, msg Message, _ error, fenced bool) error {
 	tx, err := p.pool.Begin(ctx)
 	if err != nil {
 		return fmt.Errorf("shoebox/postgres: retry begin: %w", err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
-	tag, err := tx.Exec(ctx,
-		`DELETE FROM shoebox_messages WHERE id = $1 AND queue = $2 AND status = 'processing'`, msg.ID, queue)
+	query := `DELETE FROM shoebox_messages WHERE id = $1 AND queue = $2 AND status = 'processing'`
+	args := []any{msg.ID, queue}
+	if fenced {
+		query += ` AND lease_id = $3`
+		args = append(args, msg.LeaseID)
+	}
+	tag, err := tx.Exec(ctx, query, args...)
 	if err != nil {
 		return fmt.Errorf("shoebox/postgres: retry delete: %w", err)
 	}
 	if tag.RowsAffected() != 1 {
+		if fenced {
+			return ErrLeaseLost
+		}
 		return ErrEmpty
 	}
+	// The re-enqueued row is a fresh pending claim.
+	msg.Queue = queue
+	msg.LeaseID = ""
+	msg.LeaseExpiresAt = time.Time{}
 	if err := enqueuePostgresAtomic(ctx, tx.Exec, queue, msg); err != nil {
 		return fmt.Errorf("shoebox/postgres: retry enqueue: %w", err)
 	}
@@ -560,6 +663,16 @@ func (p *Postgres) Retry(ctx context.Context, queue string, msg Message, _ error
 // DeadLetter moves a failed message to its DLQ and records the terminal
 // outcome in one transaction.
 func (p *Postgres) DeadLetter(ctx context.Context, queue string, msg Message, handlerErr error) error {
+	return p.deadLetter(ctx, queue, msg, handlerErr, false)
+}
+
+// DeadLetterClaimed moves the message to its DLQ only when msg.LeaseID is
+// the row's current fencing token.
+func (p *Postgres) DeadLetterClaimed(ctx context.Context, queue string, msg Message, handlerErr error) error {
+	return p.deadLetter(ctx, queue, msg, handlerErr, true)
+}
+
+func (p *Postgres) deadLetter(ctx context.Context, queue string, msg Message, handlerErr error, fenced bool) error {
 	tx, err := p.pool.Begin(ctx)
 	if err != nil {
 		return fmt.Errorf("shoebox/postgres: dead-letter begin: %w", err)
@@ -570,14 +683,21 @@ func (p *Postgres) DeadLetter(ctx context.Context, queue string, msg Message, ha
 	if err := enqueuePostgresAtomic(ctx, tx.Exec, dead.Queue, dead); err != nil {
 		return fmt.Errorf("shoebox/postgres: dead-letter enqueue: %w", err)
 	}
-	tag, err := tx.Exec(ctx,
-		`UPDATE shoebox_messages SET status = 'dead', error = $1, dead_at = $2
-		 WHERE id = $3 AND queue = $4 AND status = 'processing'`,
-		dead.Error, dead.DeadAt, msg.ID, queue)
+	query := `UPDATE shoebox_messages SET status = 'dead', error = $1, dead_at = $2
+			 WHERE id = $3 AND queue = $4 AND status = 'processing'`
+	args := []any{dead.Error, dead.DeadAt, msg.ID, queue}
+	if fenced {
+		query += ` AND lease_id = $5`
+		args = append(args, msg.LeaseID)
+	}
+	tag, err := tx.Exec(ctx, query, args...)
 	if err != nil {
 		return fmt.Errorf("shoebox/postgres: dead-letter update: %w", err)
 	}
 	if tag.RowsAffected() != 1 {
+		if fenced {
+			return ErrLeaseLost
+		}
 		return ErrEmpty
 	}
 	if _, err := tx.Exec(ctx,
@@ -599,7 +719,7 @@ func (p *Postgres) Replay(ctx context.Context, queue, msgID string) error {
 	defer func() { _ = tx.Rollback(ctx) }()
 
 	row := tx.QueryRow(ctx,
-		`SELECT id, payload, attempts, max_retries, created_at, scheduled_at, dedupe_key, metadata, error, dead_at, priority
+		`SELECT id, payload, attempts, max_retries, created_at, scheduled_at, dedupe_key, metadata, error, dead_at, priority, lease_id, lease_expires_at
 		 FROM shoebox_messages
 		 WHERE id = $1 AND queue = $2 AND status = 'dead'
 		 FOR UPDATE`,
@@ -639,7 +759,7 @@ func (p *Postgres) Replay(ctx context.Context, queue, msgID string) error {
 // List returns up to `limit` dead messages from a queue (DLQ inspection).
 func (p *Postgres) List(ctx context.Context, queue string, limit int) ([]Message, error) {
 	rows, err := p.pool.Query(ctx,
-		`SELECT id, payload, attempts, max_retries, created_at, scheduled_at, dedupe_key, metadata, error, dead_at, priority
+		`SELECT id, payload, attempts, max_retries, created_at, scheduled_at, dedupe_key, metadata, error, dead_at, priority, lease_id, lease_expires_at
 		 FROM shoebox_messages
 		 WHERE queue = $1 AND status = 'dead'
 		 ORDER BY dead_at DESC
@@ -668,11 +788,17 @@ func (p *Postgres) List(ctx context.Context, queue string, limit int) ([]Message
 	return msgs, nil
 }
 
-// Reclaim transitions stale 'processing' messages back to 'pending' for the
-// given queue (crash recovery, E2-S1).
+// Reclaim forcibly transitions in-flight ('processing') messages back to
+// 'pending' for the given queue and clears their lease. It is an explicit
+// operator-level reset of every claim, not the steady-state hand-off path:
+// timed-out claims are re-claimed lazily by DequeueClaimed against their
+// persisted lease_expires_at, and NewPostgres no longer calls Reclaim on
+// open so a restart preserves the original visibility deadline.
 func (p *Postgres) Reclaim(ctx context.Context, queue string) error {
 	_, err := p.pool.Exec(ctx,
-		`UPDATE shoebox_messages SET status = 'pending' WHERE queue = $1 AND status = 'processing'`,
+		`UPDATE shoebox_messages
+		 SET status = 'pending', lease_id = '', lease_expires_at = NULL
+		 WHERE queue = $1 AND status = 'processing'`,
 		queue)
 	if err != nil {
 		return fmt.Errorf("shoebox/postgres: reclaim: %w", err)
@@ -727,11 +853,12 @@ func scanPostgresMessage(row interface{ Scan(...any) error }) (Message, error) {
 	var m Message
 	var metaBytes []byte
 	var deadAt pgxType
+	var leaseExpiry pgxType
 
 	if err := row.Scan(
 		&m.ID, &m.Payload, &m.Attempts, &m.MaxRetries,
 		&m.CreatedAt, &m.ScheduledAt, &m.DedupeKey, &metaBytes, &m.Error, &deadAt.val,
-		&m.Priority,
+		&m.Priority, &m.LeaseID, &leaseExpiry.val,
 	); err != nil {
 		return m, err
 	}
@@ -742,6 +869,7 @@ func scanPostgresMessage(row interface{ Scan(...any) error }) (Message, error) {
 		}
 	}
 	m.DeadAt = deadAt.Time()
+	m.LeaseExpiresAt = leaseExpiry.Time()
 	return m, nil
 }
 

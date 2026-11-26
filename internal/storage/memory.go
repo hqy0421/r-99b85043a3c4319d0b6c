@@ -14,11 +14,16 @@ import (
 // Target scale per the PRD: hundreds to low thousands of messages per
 // minute. Replay still scans its small DLQ slice; if Memory ever needs more
 // scale, switch to indexes by queue and ID.
+//
+// In-flight messages carry a lease (LeaseID fencing token + LeaseExpiresAt
+// deadline). A claim whose deadline has passed can be re-claimed by another
+// Dequeue with a fresh LeaseID, matching the persistent backends'
+// visibility-timeout semantics exactly while the process is alive.
 type Memory struct {
 	mu        sync.Mutex
 	queues    map[string][]Message
 	counters  map[string]*QueueStats
-	inflight  map[string]map[string]struct{}
+	inflight  map[string]map[string]Message
 	dirty     map[string]bool
 	schedules map[string]Schedule
 }
@@ -28,7 +33,7 @@ func NewMemory() *Memory {
 	return &Memory{
 		queues:    make(map[string][]Message),
 		counters:  make(map[string]*QueueStats),
-		inflight:  make(map[string]map[string]struct{}),
+		inflight:  make(map[string]map[string]Message),
 		dirty:     make(map[string]bool),
 		schedules: make(map[string]Schedule),
 	}
@@ -84,22 +89,39 @@ func (m *Memory) EnqueueBatch(_ context.Context, queue string, messages []Messag
 	return nil
 }
 
+// defaultMemoryVisibility is the lease duration used by the plain
+// (non-lease-aware) Dequeue shim. It is deliberately long so direct callers
+// that never re-poll see the same effectively-unbounded claim as before; the
+// broker always drives DequeueClaimed with its configured visibility timeout.
+const defaultMemoryVisibility = 24 * time.Hour
+
 // Dequeue returns up to `limit` messages whose ScheduledAt is in the past,
 // in FIFO order. The messages are removed from the pending set; the broker
 // is expected to Ack, Retry, or DeadLetter them.
 //
+// It is the non-lease-aware shim over DequeueClaimed, using a long default
+// visibility timeout. Lease-aware callers (the broker) use DequeueClaimed
+// directly so timed-out claims can be handed to another worker.
+func (m *Memory) Dequeue(ctx context.Context, queue string, limit int) ([]Message, error) {
+	return m.DequeueClaimed(ctx, queue, limit, defaultMemoryVisibility)
+}
+
+// DequeueClaimed returns up to `limit` deliverable messages: pending messages
+// that are due (ScheduledAt <= now) and processing messages whose lease has
+// expired (LeaseExpiresAt <= now). Every returned message — including a
+// re-claimed one — carries a freshly generated LeaseID and a
+// LeaseExpiresAt of now+visibilityTimeout. Re-claimed messages keep their
+// ID, payload, and attempt count; only the claim identity changes, so a late
+// ack from the previous claimant cannot touch the new claim.
+//
 // Implementation note: we hold the lock for the whole scan + pop. That is
 // fine for the target scale; if you push this past thousands of messages
 // in flight, consider a sharded queue.
-func (m *Memory) Dequeue(_ context.Context, queue string, limit int) ([]Message, error) {
+func (m *Memory) DequeueClaimed(_ context.Context, queue string, limit int, visibilityTimeout time.Duration) ([]Message, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
 	pending := m.queues[queue]
-	if len(pending) == 0 {
-		return nil, ErrEmpty
-	}
-
 	now := time.Now()
 
 	// Sort pending by (priority DESC, created_at ASC) so the scan picks
@@ -120,37 +142,82 @@ func (m *Memory) Dequeue(_ context.Context, queue string, limit int) ([]Message,
 	kept := pending[:0]
 
 	for _, msg := range pending {
-		if len(out) >= limit {
+		if len(out) >= limit || msg.ScheduledAt.After(now) {
+			// Quota filled, or not yet due — keep waiting.
 			kept = append(kept, msg)
 			continue
 		}
-		if msg.ScheduledAt.After(now) {
-			// Not yet due — keep waiting.
-			kept = append(kept, msg)
-			continue
-		}
+		msg.LeaseID = NewLeaseID()
+		msg.LeaseExpiresAt = now.Add(visibilityTimeout)
 		out = append(out, msg)
 	}
-
 	m.queues[queue] = kept
+
+	// Expired in-flight claims are re-claimable: hand them out again under a
+	// fresh lease, preserving order by the original enqueue sequence stored
+	// on the claim. Pending messages above are considered first so a newly
+	// due message is not starved by a backlog of expired claims.
+	if len(out) < limit {
+		claims := m.inflight[queue]
+		expired := make([]Message, 0, len(claims))
+		for _, claimed := range claims {
+			if !claimed.LeaseExpiresAt.After(now) {
+				expired = append(expired, claimed)
+			}
+		}
+		sort.SliceStable(expired, func(i, j int) bool {
+			if expired[i].Priority != expired[j].Priority {
+				return expired[i].Priority > expired[j].Priority
+			}
+			return expired[i].CreatedAt.Before(expired[j].CreatedAt)
+		})
+		for _, msg := range expired {
+			if len(out) >= limit {
+				break
+			}
+			msg.LeaseID = NewLeaseID()
+			msg.LeaseExpiresAt = now.Add(visibilityTimeout)
+			out = append(out, msg)
+		}
+	}
+
 	if len(out) == 0 {
 		return nil, ErrEmpty
 	}
 	if m.inflight[queue] == nil {
-		m.inflight[queue] = make(map[string]struct{}, len(out))
+		m.inflight[queue] = make(map[string]Message, len(out))
 	}
 	for _, msg := range out {
-		m.inflight[queue][msg.ID] = struct{}{}
+		m.inflight[queue][msg.ID] = msg
 	}
 	return out, nil
 }
 
 // Ack removes a message from the in-flight set.
-func (m *Memory) Ack(_ context.Context, queue, msgID string) error {
+func (m *Memory) Ack(ctx context.Context, queue, msgID string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if _, ok := m.inflight[queue][msgID]; !ok {
 		return nil
+	}
+	delete(m.inflight[queue], msgID)
+	m.statsFor(queue).Processed++
+	return nil
+}
+
+// AckClaimed acknowledges a message only when leaseID is the current claim.
+// A stale token (the lease expired and the message was re-claimed or
+// completed) returns ErrLeaseLost and leaves the current claim untouched.
+func (m *Memory) AckClaimed(_ context.Context, queue, msgID, leaseID string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	claimed, ok := m.inflight[queue][msgID]
+	if !ok {
+		// Already acked, retried, or dead-lettered: the claim is gone.
+		return ErrLeaseLost
+	}
+	if claimed.LeaseID != leaseID {
+		return ErrLeaseLost
 	}
 	delete(m.inflight[queue], msgID)
 	m.statsFor(queue).Processed++
@@ -178,13 +245,61 @@ func (m *Memory) AckBatch(_ context.Context, queue string, msgIDs []string) erro
 	return nil
 }
 
+// AckClaimedBatch acknowledges each claim only when its LeaseID is current.
+// Stale claims are skipped without affecting the others; the processed
+// counter advances once per message actually removed.
+func (m *Memory) AckClaimedBatch(_ context.Context, queue string, claims []Claim) error {
+	if len(claims) == 0 {
+		return nil
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var processed uint64
+	for _, claim := range claims {
+		claimed, ok := m.inflight[queue][claim.MessageID]
+		if !ok || claimed.LeaseID != claim.LeaseID {
+			continue
+		}
+		delete(m.inflight[queue], claim.MessageID)
+		processed++
+	}
+	if processed > 0 {
+		m.statsFor(queue).Processed += processed
+	}
+	return nil
+}
+
 // Retry records a failed delivery and re-enqueues the updated message as one
 // in-memory transition.
-func (m *Memory) Retry(_ context.Context, queue string, msg Message, _ error) error {
+func (m *Memory) Retry(ctx context.Context, queue string, msg Message, err error) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	delete(m.inflight[queue], msg.ID)
 	msg.Queue = queue
+	msg.LeaseID = ""
+	msg.LeaseExpiresAt = time.Time{}
+	m.queues[queue] = append(m.queues[queue], msg)
+	m.dirty[queue] = true
+	s := m.statsFor(queue)
+	s.Errors++
+	s.Retries++
+	return nil
+}
+
+// RetryClaimed records a failed delivery only when msg.LeaseID is the current
+// claim. A late failure from an expired-and-reclaimed worker returns
+// ErrLeaseLost and leaves the newer claim (or the completed state) intact.
+func (m *Memory) RetryClaimed(_ context.Context, queue string, msg Message, _ error) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	claimed, ok := m.inflight[queue][msg.ID]
+	if !ok || claimed.LeaseID != msg.LeaseID {
+		return ErrLeaseLost
+	}
+	delete(m.inflight[queue], msg.ID)
+	msg.Queue = queue
+	msg.LeaseID = ""
+	msg.LeaseExpiresAt = time.Time{}
 	m.queues[queue] = append(m.queues[queue], msg)
 	m.dirty[queue] = true
 	s := m.statsFor(queue)
@@ -200,6 +315,26 @@ func (m *Memory) DeadLetter(_ context.Context, queue string, msg Message, err er
 	defer m.mu.Unlock()
 	delete(m.inflight[queue], msg.ID)
 	dead := deadLetterMessage(queue, msg, err, time.Now().UTC())
+	m.queues[dead.Queue] = append(m.queues[dead.Queue], dead)
+	m.dirty[dead.Queue] = true
+	m.statsFor(queue).Dead++
+	return nil
+}
+
+// DeadLetterClaimed moves a message to its DLQ only when msg.LeaseID is the
+// current claim. A stale claimant cannot overwrite a newer claim or a message
+// that already reached a terminal state.
+func (m *Memory) DeadLetterClaimed(_ context.Context, queue string, msg Message, err error) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	claimed, ok := m.inflight[queue][msg.ID]
+	if !ok || claimed.LeaseID != msg.LeaseID {
+		return ErrLeaseLost
+	}
+	delete(m.inflight[queue], msg.ID)
+	dead := deadLetterMessage(queue, msg, err, time.Now().UTC())
+	dead.LeaseID = ""
+	dead.LeaseExpiresAt = time.Time{}
 	m.queues[dead.Queue] = append(m.queues[dead.Queue], dead)
 	m.dirty[dead.Queue] = true
 	m.statsFor(queue).Dead++

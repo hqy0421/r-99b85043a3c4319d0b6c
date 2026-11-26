@@ -38,6 +38,15 @@ type Options struct {
 	// Concurrency is the per-queue worker pool size. Defaults to 4.
 	Concurrency int
 
+	// VisibilityTimeout is how long a dequeued message is exclusively
+	// claimed by one worker. If the message is not acknowledged before the
+	// deadline, another worker may re-claim it; every re-claim gets a
+	// distinct lease identity, so a late acknowledgement from the previous
+	// worker cannot overwrite the new claim or a completed message.
+	// Defaults to 30s. The deadline is persisted by SQLite and Postgres, so
+	// a restart keeps judging expiry against the original claim time.
+	VisibilityTimeout time.Duration
+
 	// Logger receives structured events. Defaults to slog.Default().
 	Logger *slog.Logger
 

@@ -249,6 +249,32 @@ is being handled, persistent backends can make the message available again on
 startup. Handlers should therefore be safe to retry. Deduplication is
 best-effort and in-memory, not exactly-once delivery.
 
+### Visibility timeout and lease fencing
+
+Every dequeue hands out a **lease**: a random `LeaseID` fencing token plus an
+absolute `LeaseExpiresAt` deadline derived from `Options.VisibilityTimeout`
+(default 30s). While the lease is valid the message is exclusively claimed.
+If it is not acknowledged before the deadline — because the worker crashed,
+stalled, or simply ran long — another worker can re-claim it. Each re-claim
+mints a **different** `LeaseID` while preserving the message ID, payload, and
+attempt count.
+
+Acknowledgement, retry, and dead-letter transitions all carry the claimant's
+`LeaseID`. A late operation from an expired claim is rejected with
+`storage.ErrLeaseLost` and can never overwrite a newer claim or an already
+completed message, so the currently valid confirmation still completes the
+message exactly once. The deadline is stored, not recomputed: after a
+restart, in-flight messages keep expiring against their original claim time.
+The in-memory backend applies the same boundary while the process is alive.
+
+```go
+q, _ := shoebox.New(shoebox.Options{
+    Storage:           shoebox.SQLite,
+    Path:              "shoebox.db",
+    VisibilityTimeout: 30 * time.Second,
+})
+```
+
 ### Retries and dead letters
 
 Handlers can set a retry limit, timeout, and backoff strategy. The supported
@@ -465,20 +491,26 @@ webhooks:
     timeout: 10s
 ```
 
-CLI flags (`--addr`, `--storage`, `--path`, `--dsn`, `--schema`, and `--auth-token`)
-override values from the config file. See
-[`cmd/shoeboxd/config.example.yaml`](cmd/shoeboxd/config.example.yaml).
+CLI flags (`--addr`, `--storage`, `--path`, `--dsn`, `--schema`,
+`--auth-token`, and `--visibility-timeout`) override values from the config
+file. See [`cmd/shoeboxd/config.example.yaml`](cmd/shoeboxd/config.example.yaml).
 
 The HTTP API is under `/api/`:
 
 | Method | Path | Purpose |
 |--------|------|---------|
 | `POST` | `/queues/{name}/messages` | Enqueue a message |
-| `GET` | `/queues/{name}/messages/next` | Pull one message |
+| `GET` | `/queues/{name}/messages/next` | Pull one message under a lease |
 | `GET` | `/queues/{name}/stats` | Read queue depth and counters |
 | `GET` | `/queues/{name}/dlq` | List dead-letter messages |
 | `POST` | `/queues/{name}/dlq/{id}/replay` | Replay a dead-letter message |
-| `DELETE` | `/queues/{name}/messages/{id}` | Acknowledge/delete a message |
+| `DELETE` | `/queues/{name}/messages/{id}?lease_id=...` | Acknowledge/delete a message |
+
+A pulled message carries its `lease_id` in the response body. Echo it back on
+the acknowledgement (as the `lease_id` query parameter or the
+`X-Shoebox-Lease-Id` header). A missing or stale lease is rejected with
+`409 Conflict`: the message was re-claimed after its visibility timeout, or
+it is already completed.
 
 Example enqueue and pull flow:
 
@@ -489,6 +521,10 @@ curl -X POST http://localhost:8080/api/queues/orders/messages \
   -d '{"payload":"{\"order_id\":123}"}'
 
 curl http://localhost:8080/api/queues/orders/messages/next \
+  -H 'Authorization: Bearer secret'
+
+# Acknowledge using the lease_id from the pull response:
+curl -X DELETE 'http://localhost:8080/api/queues/orders/messages/MSG_ID?lease_id=LEASE_ID' \
   -H 'Authorization: Bearer secret'
 ```
 

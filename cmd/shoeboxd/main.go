@@ -35,13 +35,14 @@ import (
 
 func main() {
 	var (
-		configPath = flag.String("config", "", "path to YAML config file (overrides flags)")
-		addr       = flag.String("addr", "", "address to listen on (overrides config)")
-		storage    = flag.String("storage", "", "memory | sqlite | postgres (overrides config)")
-		dbPath     = flag.String("path", "", "SQLite database path (overrides config)")
-		dsn        = flag.String("dsn", "", "Postgres DSN (overrides config)")
-		dbSchema   = flag.String("schema", "", "Postgres schema (overrides config)")
-		authToken  = flag.String("auth-token", "", "bearer token / X-API-Key (overrides config)")
+		configPath        = flag.String("config", "", "path to YAML config file (overrides flags)")
+		addr              = flag.String("addr", "", "address to listen on (overrides config)")
+		storage           = flag.String("storage", "", "memory | sqlite | postgres (overrides config)")
+		dbPath            = flag.String("path", "", "SQLite database path (overrides config)")
+		dsn               = flag.String("dsn", "", "Postgres DSN (overrides config)")
+		dbSchema          = flag.String("schema", "", "Postgres schema (overrides config)")
+		authToken         = flag.String("auth-token", "", "bearer token / X-API-Key (overrides config)")
+		visibilityTimeout = flag.Duration("visibility-timeout", 0, "claim lease before a message is re-deliverable (overrides config)")
 	)
 	flag.Parse()
 
@@ -75,9 +76,15 @@ func main() {
 	if *authToken != "" {
 		cfg.Server.AuthToken = *authToken
 	}
+	if *visibilityTimeout > 0 {
+		cfg.Storage.VisibilityTimeout = *visibilityTimeout
+	}
 
 	// --- build engine ---
-	opts := shoebox.Options{Logger: logger}
+	opts := shoebox.Options{
+		Logger:            logger,
+		VisibilityTimeout: cfg.Storage.VisibilityTimeout,
+	}
 	switch cfg.Storage.Kind {
 	case "memory":
 		opts.Storage = shoebox.Memory
@@ -125,7 +132,8 @@ func main() {
 	}
 
 	dlqMgr := dlq.NewManager(q.Store())
-	apiHandler := api.NewHandler(q.Store(), dlqMgr, logger)
+	apiHandler := api.NewHandler(q.Store(), dlqMgr, logger).
+		WithVisibilityTimeout(cfg.Storage.VisibilityTimeout)
 	dash := dashboard.New(q.Store(), dlqMgr, q.Queues, logger)
 
 	// --- wire HTTP routes ---

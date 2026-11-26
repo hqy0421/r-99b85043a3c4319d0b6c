@@ -62,11 +62,12 @@ func New(opts Options) (*Queue, error) {
 	metrics := NewMetrics("", opts.MetricsRegistry)
 	q := &Queue{
 		b: broker.New(broker.Options{
-			Storage:          store,
-			Concurrency:      opts.Concurrency,
-			Logger:           opts.Logger,
-			AckBatchSize:     opts.Batching.AckBatchSize,
-			AckFlushInterval: opts.Batching.AckFlushInterval,
+			Storage:           store,
+			Concurrency:       opts.Concurrency,
+			VisibilityTimeout: opts.VisibilityTimeout,
+			Logger:            opts.Logger,
+			AckBatchSize:      opts.Batching.AckBatchSize,
+			AckFlushInterval:  opts.Batching.AckFlushInterval,
 			Dedupe: broker.DedupeOptions{
 				Policy:   broker.DedupePolicy(opts.Dedupe.Policy),
 				Capacity: opts.Dedupe.Capacity,

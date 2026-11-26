@@ -176,15 +176,12 @@ func NewSQLite(ctx context.Context, path string) (*SQLite, error) {
 
 	s := &SQLite{db: db}
 
-	// Reclaim stale in-flight messages from a previous crash. Every
-	// "processing" row across all queues goes back to "pending" so the
-	// dispatcher picks it up again.
-	if _, err := db.ExecContext(ctx,
-		`UPDATE shoebox_messages SET status = 'pending' WHERE status = 'processing'`); err != nil {
-		_ = db.Close()
-		return nil, fmt.Errorf("shoebox/sqlite: reclaim: %w", err)
-	}
-
+	// No blanket reclaim on open. 'processing' rows keep their persisted
+	// lease_expires_at; Dequeue re-claims them only once that original
+	// deadline passes, so restart preserves the visibility boundary instead
+	// of resetting every in-flight claim. Rows written by builds predating
+	// leases carry lease_expires_at = '' (the zero text), which compares
+	// before any RFC3339 timestamp and is therefore immediately re-claimable.
 	return s, nil
 }
 
@@ -241,8 +238,8 @@ type sqliteExecer interface {
 }
 
 const sqliteInsertSQL = `INSERT INTO shoebox_messages
-	(id, queue, payload, attempts, max_retries, created_at, scheduled_at, priority, dedupe_key, metadata, error, dead_at, status)
-	VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+	(id, queue, payload, attempts, max_retries, created_at, scheduled_at, priority, dedupe_key, metadata, error, dead_at, status, lease_id, lease_expires_at)
+	VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
 
 func sqliteEnqueueArgs(queue string, msg Message) ([]any, error) {
 	meta, err := json.Marshal(msg.Metadata)
@@ -263,12 +260,19 @@ func sqliteEnqueueArgs(queue string, msg Message) ([]any, error) {
 	if strings.HasSuffix(queue, ".dlq") {
 		status = "dead"
 	}
+	// Freshly enqueued (including retry/replay) messages hold no claim: the
+	// next Dequeue assigns their first LeaseID and deadline.
+	leaseID := msg.LeaseID
+	leaseExpiry := ""
+	if !msg.LeaseExpiresAt.IsZero() {
+		leaseExpiry = msg.LeaseExpiresAt.Format(time.RFC3339Nano)
+	}
 	return []any{
 		msg.ID, queue, payload, msg.Attempts, msg.MaxRetries,
 		msg.CreatedAt.Format(time.RFC3339Nano),
 		msg.ScheduledAt.Format(time.RFC3339Nano),
 		msg.Priority, msg.DedupeKey, string(meta), msg.Error,
-		tsOrEmpty(msg.DeadAt), status,
+		tsOrEmpty(msg.DeadAt), status, leaseID, leaseExpiry,
 	}, nil
 }
 
@@ -284,25 +288,53 @@ func enqueueSQLite(ctx context.Context, execer sqliteExecer, queue string, msg M
 	return nil
 }
 
-// Dequeue atomically transitions up to `limit` due messages from 'pending' to
-// 'processing' and returns them. Messages whose ScheduledAt is in the future
-// are skipped. If no messages are due it returns ErrEmpty.
+// defaultSQLiteVisibility is the lease duration used by the plain
+// (non-lease-aware) Dequeue shim. Long enough that direct Storage callers
+// see effectively unbounded claims; the broker drives DequeueClaimed with
+// its own configured visibility timeout.
+const defaultSQLiteVisibility = 24 * time.Hour
+
+// Dequeue atomically claims up to `limit` deliverable messages and returns
+// them. It is the non-lease-aware shim over DequeueClaimed with a long
+// default visibility timeout.
 func (s *SQLite) Dequeue(ctx context.Context, queue string, limit int) ([]Message, error) {
+	return s.DequeueClaimed(ctx, queue, limit, defaultSQLiteVisibility)
+}
+
+// DequeueClaimed atomically claims up to `limit` deliverable messages and
+// returns them. Eligible rows are:
+//   - 'pending' messages whose ScheduledAt has arrived, and
+//   - 'processing' messages whose lease_expires_at has passed (timed-out
+//     claims, reclaimable by another worker without a restart).
+//
+// Every claimed row — including a re-claimed one — receives a freshly
+// generated lease_id (fencing token) and lease_expires_at = now +
+// visibilityTimeout. The message ID, payload, and attempt count are
+// preserved; only the claim identity changes, so a late ack carrying the
+// previous lease_id cannot affect the new claim. Rows still inside their
+// lease window are never returned to a second worker.
+func (s *SQLite) DequeueClaimed(ctx context.Context, queue string, limit int, visibilityTimeout time.Duration) ([]Message, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, fmt.Errorf("shoebox/sqlite: dequeue begin: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }() // safe to call after Commit
 
-	now := time.Now().Format(time.RFC3339Nano)
+	now := time.Now()
+	nowText := now.Format(time.RFC3339Nano)
+	deadlineText := now.Add(visibilityTimeout).Format(time.RFC3339Nano)
 
 	rows, err := tx.QueryContext(ctx,
-		`SELECT id, payload, attempts, max_retries, created_at, scheduled_at, dedupe_key, metadata, error, dead_at, priority
+		`SELECT id, payload, attempts, max_retries, created_at, scheduled_at, dedupe_key, metadata, error, dead_at, priority, lease_id, lease_expires_at
 		 FROM shoebox_messages
-		 WHERE queue = ? AND status = 'pending' AND scheduled_at <= ?
+		 WHERE queue = ?
+		   AND (
+		     (status = 'pending' AND scheduled_at <= ?)
+		     OR (status = 'processing' AND lease_expires_at <= ?)
+		   )
 		 ORDER BY priority DESC, created_at ASC
 		 LIMIT ?`,
-		queue, now, limit)
+		queue, nowText, nowText, limit)
 	if err != nil {
 		return nil, fmt.Errorf("shoebox/sqlite: dequeue query: %w", err)
 	}
@@ -326,13 +358,22 @@ func (s *SQLite) Dequeue(ctx context.Context, queue string, limit int) ([]Messag
 		return nil, ErrEmpty
 	}
 
-	// Transition the dequeued messages to 'processing' atomically.
+	// Stamp each claim with a fresh fencing token and deadline. The status
+	// guard re-checks eligibility so a row changed between SELECT and UPDATE
+	// cannot be claimed twice; the single connection makes that defensive
+	// rather than expected.
 	for i := range msgs {
+		leaseID := NewLeaseID()
 		if _, err := tx.ExecContext(ctx,
-			`UPDATE shoebox_messages SET status = 'processing' WHERE id = ? AND queue = ?`,
-			msgs[i].ID, queue); err != nil {
+			`UPDATE shoebox_messages
+			 SET status = 'processing', lease_id = ?, lease_expires_at = ?
+			 WHERE id = ? AND queue = ?
+			   AND (status = 'pending' OR (status = 'processing' AND lease_expires_at <= ?))`,
+			leaseID, deadlineText, msgs[i].ID, queue, nowText); err != nil {
 			return nil, fmt.Errorf("shoebox/sqlite: dequeue mark processing: %w", err)
 		}
+		msgs[i].LeaseID = leaseID
+		msgs[i].LeaseExpiresAt = now.Add(visibilityTimeout)
 	}
 
 	if err := tx.Commit(); err != nil {
@@ -341,16 +382,34 @@ func (s *SQLite) Dequeue(ctx context.Context, queue string, limit int) ([]Messag
 	return msgs, nil
 }
 
-// Ack removes a successfully processed message.
+// Ack removes a successfully processed message. It is the non-lease-aware
+// shim: any processing row with the ID is removed.
 func (s *SQLite) Ack(ctx context.Context, queue, msgID string) error {
+	return s.ack(ctx, queue, msgID, "", false)
+}
+
+// AckClaimed removes a processing message only when leaseID is the row's
+// current fencing token. A stale token (lease expired and the message was
+// re-claimed, or the row is already gone) returns ErrLeaseLost without
+// touching the newer claim or the completed state.
+func (s *SQLite) AckClaimed(ctx context.Context, queue, msgID, leaseID string) error {
+	return s.ack(ctx, queue, msgID, leaseID, true)
+}
+
+func (s *SQLite) ack(ctx context.Context, queue, msgID, leaseID string, fenced bool) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("shoebox/sqlite: ack begin: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	result, err := tx.ExecContext(ctx,
-		`DELETE FROM shoebox_messages WHERE id = ? AND queue = ? AND status = 'processing'`, msgID, queue)
+	query := `DELETE FROM shoebox_messages WHERE id = ? AND queue = ? AND status = 'processing'`
+	args := []any{msgID, queue}
+	if fenced {
+		query += ` AND lease_id = ?`
+		args = append(args, leaseID)
+	}
+	result, err := tx.ExecContext(ctx, query, args...)
 	if err != nil {
 		return fmt.Errorf("shoebox/sqlite: ack delete: %w", err)
 	}
@@ -359,6 +418,9 @@ func (s *SQLite) Ack(ctx context.Context, queue, msgID string) error {
 		return fmt.Errorf("shoebox/sqlite: ack delete rows: %w", err)
 	}
 	if rows == 0 {
+		if fenced {
+			return ErrLeaseLost
+		}
 		return tx.Commit()
 	}
 	if _, err := tx.ExecContext(ctx,
@@ -374,7 +436,23 @@ func (s *SQLite) Ack(ctx context.Context, queue, msgID string) error {
 
 // AckBatch deletes processing messages and updates processed atomically.
 func (s *SQLite) AckBatch(ctx context.Context, queue string, msgIDs []string) error {
-	if len(msgIDs) == 0 {
+	claims := make([]Claim, len(msgIDs))
+	for i, id := range msgIDs {
+		claims[i] = Claim{MessageID: id}
+	}
+	return s.ackBatch(ctx, queue, claims, false)
+}
+
+// AckClaimedBatch deletes processing rows whose current lease_id matches the
+// claim. Non-matching claims are skipped (not an error); processed advances
+// once per row actually deleted, so a valid confirmation completes the
+// message exactly once even if stale claims arrive in the same batch.
+func (s *SQLite) AckClaimedBatch(ctx context.Context, queue string, claims []Claim) error {
+	return s.ackBatch(ctx, queue, claims, true)
+}
+
+func (s *SQLite) ackBatch(ctx context.Context, queue string, claims []Claim, fenced bool) error {
+	if len(claims) == 0 {
 		return nil
 	}
 	tx, err := s.db.BeginTx(ctx, nil)
@@ -383,15 +461,15 @@ func (s *SQLite) AckBatch(ctx context.Context, queue string, msgIDs []string) er
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	stmt, err := tx.PrepareContext(ctx, `DELETE FROM shoebox_messages WHERE id = ? AND queue = ? AND status = 'processing'`)
-	if err != nil {
-		return fmt.Errorf("shoebox/sqlite: ack batch prepare: %w", err)
-	}
-	defer func() { _ = stmt.Close() }()
-
 	var processed int64
-	for _, msgID := range msgIDs {
-		result, err := stmt.ExecContext(ctx, msgID, queue)
+	for _, claim := range claims {
+		query := `DELETE FROM shoebox_messages WHERE id = ? AND queue = ? AND status = 'processing'`
+		args := []any{claim.MessageID, queue}
+		if fenced {
+			query += ` AND lease_id = ?`
+			args = append(args, claim.LeaseID)
+		}
+		result, err := tx.ExecContext(ctx, query, args...)
 		if err != nil {
 			return fmt.Errorf("shoebox/sqlite: ack batch delete: %w", err)
 		}
@@ -416,23 +494,48 @@ func (s *SQLite) AckBatch(ctx context.Context, queue string, msgIDs []string) er
 
 // Retry records the failed delivery and persists the updated message for a
 // future delivery in one transaction.
-func (s *SQLite) Retry(ctx context.Context, queue string, msg Message, _ error) error {
+func (s *SQLite) Retry(ctx context.Context, queue string, msg Message, err error) error {
+	return s.retry(ctx, queue, msg, err, false)
+}
+
+// RetryClaimed records the failure only when msg.LeaseID is the row's current
+// fencing token. A late failure from an expired-and-reclaimed worker returns
+// ErrLeaseLost: the newer claim keeps running and the stale retry is never
+// re-enqueued over it.
+func (s *SQLite) RetryClaimed(ctx context.Context, queue string, msg Message, err error) error {
+	return s.retry(ctx, queue, msg, err, true)
+}
+
+func (s *SQLite) retry(ctx context.Context, queue string, msg Message, _ error, fenced bool) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("shoebox/sqlite: retry begin: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	result, err := tx.ExecContext(ctx,
-		`DELETE FROM shoebox_messages WHERE id = ? AND queue = ? AND status = 'processing'`, msg.ID, queue)
+	deleteQuery := `DELETE FROM shoebox_messages WHERE id = ? AND queue = ? AND status = 'processing'`
+	deleteArgs := []any{msg.ID, queue}
+	if fenced {
+		deleteQuery += ` AND lease_id = ?`
+		deleteArgs = append(deleteArgs, msg.LeaseID)
+	}
+	result, err := tx.ExecContext(ctx, deleteQuery, deleteArgs...)
 	if err != nil {
 		return fmt.Errorf("shoebox/sqlite: retry delete: %w", err)
 	}
 	if n, err := result.RowsAffected(); err != nil {
 		return fmt.Errorf("shoebox/sqlite: retry delete rows: %w", err)
 	} else if n != 1 {
+		if fenced {
+			return ErrLeaseLost
+		}
 		return ErrEmpty
 	}
+	// The re-enqueued row is a fresh pending claim: drop the old fencing
+	// token and deadline so the next Dequeue assigns new ones.
+	msg.Queue = queue
+	msg.LeaseID = ""
+	msg.LeaseExpiresAt = time.Time{}
 	if err := enqueueSQLite(ctx, tx, queue, msg); err != nil {
 		return fmt.Errorf("shoebox/sqlite: retry enqueue: %w", err)
 	}
@@ -449,6 +552,17 @@ func (s *SQLite) Retry(ctx context.Context, queue string, msg Message, _ error) 
 // DeadLetter moves a failed message to its DLQ and records the terminal
 // outcome in one transaction.
 func (s *SQLite) DeadLetter(ctx context.Context, queue string, msg Message, handlerErr error) error {
+	return s.deadLetter(ctx, queue, msg, handlerErr, false)
+}
+
+// DeadLetterClaimed moves the message to its DLQ only when msg.LeaseID is
+// the row's current fencing token. A stale claimant cannot move a newer
+// claim — or a message already completed by another claim — into the DLQ.
+func (s *SQLite) DeadLetterClaimed(ctx context.Context, queue string, msg Message, handlerErr error) error {
+	return s.deadLetter(ctx, queue, msg, handlerErr, true)
+}
+
+func (s *SQLite) deadLetter(ctx context.Context, queue string, msg Message, handlerErr error, fenced bool) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("shoebox/sqlite: dead-letter begin: %w", err)
@@ -456,19 +570,30 @@ func (s *SQLite) DeadLetter(ctx context.Context, queue string, msg Message, hand
 	defer func() { _ = tx.Rollback() }()
 
 	dead := deadLetterMessage(queue, msg, handlerErr, time.Now().UTC())
+	dead.LeaseID = ""
+	dead.LeaseExpiresAt = time.Time{}
 	if err := enqueueSQLite(ctx, tx, dead.Queue, dead); err != nil {
 		return fmt.Errorf("shoebox/sqlite: dead-letter enqueue: %w", err)
 	}
-	result, err := tx.ExecContext(ctx,
-		`UPDATE shoebox_messages SET status = 'dead', error = ?, dead_at = ?
-		 WHERE id = ? AND queue = ? AND status = 'processing'`,
-		dead.Error, dead.DeadAt.Format(time.RFC3339Nano), msg.ID, queue)
+	updateQuery := `UPDATE shoebox_messages SET status = 'dead', error = ?, dead_at = ?
+			 WHERE id = ? AND queue = ? AND status = 'processing'`
+	updateArgs := []any{
+		dead.Error, dead.DeadAt.Format(time.RFC3339Nano), msg.ID, queue,
+	}
+	if fenced {
+		updateQuery += ` AND lease_id = ?`
+		updateArgs = append(updateArgs, msg.LeaseID)
+	}
+	result, err := tx.ExecContext(ctx, updateQuery, updateArgs...)
 	if err != nil {
 		return fmt.Errorf("shoebox/sqlite: dead-letter update: %w", err)
 	}
 	if n, err := result.RowsAffected(); err != nil {
 		return fmt.Errorf("shoebox/sqlite: dead-letter update rows: %w", err)
 	} else if n != 1 {
+		if fenced {
+			return ErrLeaseLost
+		}
 		return ErrEmpty
 	}
 	if _, err := tx.ExecContext(ctx,
@@ -490,7 +615,7 @@ func (s *SQLite) Replay(ctx context.Context, queue, msgID string) error {
 	defer func() { _ = tx.Rollback() }()
 
 	row := tx.QueryRowContext(ctx,
-		`SELECT id, payload, attempts, max_retries, created_at, scheduled_at, dedupe_key, metadata, error, dead_at, priority
+		`SELECT id, payload, attempts, max_retries, created_at, scheduled_at, dedupe_key, metadata, error, dead_at, priority, lease_id, lease_expires_at
 		 FROM shoebox_messages
 		 WHERE id = ? AND queue = ? AND status = 'dead'`,
 		msgID, queue+".dlq")
@@ -532,7 +657,7 @@ func (s *SQLite) Replay(ctx context.Context, queue, msgID string) error {
 // The queue name should be the shadow queue name (e.g. "orders.dlq").
 func (s *SQLite) List(ctx context.Context, queue string, limit int) ([]Message, error) {
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT id, payload, attempts, max_retries, created_at, scheduled_at, dedupe_key, metadata, error, dead_at, priority
+		`SELECT id, payload, attempts, max_retries, created_at, scheduled_at, dedupe_key, metadata, error, dead_at, priority, lease_id, lease_expires_at
 		 FROM shoebox_messages
 		 WHERE queue = ? AND status = 'dead'
 		 ORDER BY dead_at DESC
@@ -561,12 +686,17 @@ func (s *SQLite) List(ctx context.Context, queue string, limit int) ([]Message, 
 	return msgs, nil
 }
 
-// Reclaim transitions stale in-flight ('processing') messages back to
-// 'pending' for the given queue. Called on open for crash recovery (E2-S1).
-// For per-queue reclaim; the global reclaim (all queues) is done in NewSQLite.
+// Reclaim forcibly transitions in-flight ('processing') messages back to
+// 'pending' for the given queue and clears their lease. It is an explicit
+// operator-level reset of every claim, not the steady-state hand-off path:
+// timed-out claims are re-claimed lazily by DequeueClaimed against their
+// persisted lease_expires_at, and NewSQLite no longer calls Reclaim on open
+// so a restart preserves the original visibility deadline.
 func (s *SQLite) Reclaim(ctx context.Context, queue string) error {
 	_, err := s.db.ExecContext(ctx,
-		`UPDATE shoebox_messages SET status = 'pending' WHERE queue = ? AND status = 'processing'`,
+		`UPDATE shoebox_messages
+		 SET status = 'pending', lease_id = '', lease_expires_at = ''
+		 WHERE queue = ? AND status = 'processing'`,
 		queue)
 	if err != nil {
 		return fmt.Errorf("shoebox/sqlite: reclaim: %w", err)
@@ -621,12 +751,12 @@ func scanMessage(rs interface {
 }) (Message, error) {
 	var m Message
 	var metaStr string
-	var createdAt, scheduledAt, deadAtStr, errStr string
+	var createdAt, scheduledAt, deadAtStr, errStr, leaseID, leaseExpiry string
 
 	if err := rs.Scan(
 		&m.ID, &m.Payload, &m.Attempts, &m.MaxRetries,
 		&createdAt, &scheduledAt, &m.DedupeKey, &metaStr, &errStr, &deadAtStr,
-		&m.Priority,
+		&m.Priority, &leaseID, &leaseExpiry,
 	); err != nil {
 		return m, err
 	}
@@ -650,6 +780,13 @@ func scanMessage(rs interface {
 		m.DeadAt, err = time.Parse(time.RFC3339Nano, deadAtStr)
 		if err != nil {
 			return m, fmt.Errorf("parse dead_at %q: %w", deadAtStr, err)
+		}
+	}
+	m.LeaseID = leaseID
+	if leaseExpiry != "" {
+		m.LeaseExpiresAt, err = time.Parse(time.RFC3339Nano, leaseExpiry)
+		if err != nil {
+			return m, fmt.Errorf("parse lease_expires_at %q: %w", leaseExpiry, err)
 		}
 	}
 	return m, nil

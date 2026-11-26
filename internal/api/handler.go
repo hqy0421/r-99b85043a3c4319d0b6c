@@ -26,12 +26,18 @@ import (
 	"github.com/adexaja/shoebox/internal/storage"
 )
 
+// defaultAPIVisibility is the lease duration stamped on pull-based claims
+// when no override is configured. It mirrors the broker's default so a
+// pulled message and a dispatched message have the same hand-off boundary.
+const defaultAPIVisibility = 30 * time.Second
+
 // Handler holds the dependencies shared by all HTTP endpoints: the storage
 // backend (for enqueue/dequeue/ack/stats) and the DLQ manager (for list/replay).
 type Handler struct {
-	store  storage.Storage
-	dlq    *dlq.Manager
-	logger *slog.Logger
+	store      storage.Storage
+	visibility time.Duration
+	dlq        *dlq.Manager
+	logger     *slog.Logger
 }
 
 // NewHandler creates an API Handler.
@@ -39,7 +45,22 @@ func NewHandler(store storage.Storage, dlqMgr *dlq.Manager, logger *slog.Logger)
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &Handler{store: store, dlq: dlqMgr, logger: logger}
+	return &Handler{
+		store:      store,
+		visibility: defaultAPIVisibility,
+		dlq:        dlqMgr,
+		logger:     logger,
+	}
+}
+
+// WithVisibilityTimeout overrides the lease duration granted to pull-based
+// claims. Non-positive values leave the default in place. It returns the
+// handler for chaining at construction time.
+func (h *Handler) WithVisibilityTimeout(d time.Duration) *Handler {
+	if d > 0 {
+		h.visibility = d
+	}
+	return h
 }
 
 // Register mounts all API routes on the given mux. Uses Go 1.22+ routing
@@ -126,17 +147,28 @@ func (h *Handler) enqueue(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusCreated, enqueueResponse{ID: msg.ID})
 }
 
+// dequeue pulls messages through the lease-aware path when the backend
+// supports it, so pulled messages carry a LeaseID and become re-claimable
+// after the visibility timeout instead of only on process restart.
+func (h *Handler) dequeue(ctx context.Context, queue string, limit int) ([]storage.Message, error) {
+	if leased, ok := h.store.(storage.VisibilityStorage); ok {
+		return leased.DequeueClaimed(ctx, queue, limit, h.visibility)
+	}
+	return h.store.Dequeue(ctx, queue, limit)
+}
+
 // consume handles GET /queues/{name}/messages/next.
-// It pulls one message from the queue (status pending → processing). The
-// caller is responsible for DELETE-ing the message to ack it; if they don't,
-// the message is reclaimed to pending on the next open (crash recovery).
+// It pulls one message from the queue under a lease. The caller is
+// responsible for DELETE-ing the message (echoing its lease_id) to ack it;
+// if they don't, the message becomes re-claimable once its visibility
+// timeout expires — no restart required.
 func (h *Handler) consume(w http.ResponseWriter, r *http.Request) {
 	queue := r.PathValue("name")
 
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
 
-	msgs, err := h.store.Dequeue(ctx, queue, 1)
+	msgs, err := h.dequeue(ctx, queue, 1)
 	if err != nil {
 		if errors.Is(err, storage.ErrEmpty) {
 			writeError(w, http.StatusNotFound, "no messages available")
@@ -219,12 +251,42 @@ func (h *Handler) replayDLQ(w http.ResponseWriter, r *http.Request) {
 }
 
 // ack handles DELETE /queues/{name}/messages/{id}.
+//
+// When the storage supports leases, the request must present the lease_id
+// returned with the message, either as the ?lease_id= query parameter or the
+// X-Shoebox-Lease-Id header. An ack carrying a stale or missing lease is
+// rejected with 409 Conflict: the claim has either expired and been
+// re-claimed by another worker, or the message is already completed.
+// Backends without leases accept the plain DELETE as before.
 func (h *Handler) ack(w http.ResponseWriter, r *http.Request) {
 	queue := r.PathValue("name")
 	id := r.PathValue("id")
 
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
+
+	if leased, ok := h.store.(storage.VisibilityStorage); ok {
+		leaseID := r.URL.Query().Get("lease_id")
+		if leaseID == "" {
+			leaseID = r.Header.Get("X-Shoebox-Lease-Id")
+		}
+		if leaseID == "" {
+			writeError(w, http.StatusConflict, "lease_id is required to acknowledge a leased message")
+			return
+		}
+		if err := leased.AckClaimed(ctx, queue, id, leaseID); err != nil {
+			if errors.Is(err, storage.ErrLeaseLost) {
+				writeError(w, http.StatusConflict, "lease no longer held; message was re-claimed or completed")
+				return
+			}
+			h.logger.ErrorContext(ctx, "api: ack failed",
+				slog.String("queue", queue), slog.String("id", id), slog.Any("err", err))
+			writeError(w, http.StatusInternalServerError, "ack failed")
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]string{"status": "acked"})
+		return
+	}
 
 	if err := h.store.Ack(ctx, queue, id); err != nil {
 		writeError(w, http.StatusInternalServerError, "ack failed")

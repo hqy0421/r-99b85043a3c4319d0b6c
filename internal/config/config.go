@@ -48,10 +48,11 @@ type ServerConfig struct {
 
 // StorageConfig selects and configures the storage backend.
 type StorageConfig struct {
-	Kind   string `yaml:"kind"`   // memory | sqlite | postgres
-	Path   string `yaml:"path"`   // SQLite database path
-	DSN    string `yaml:"dsn"`    // Postgres DSN
-	Schema string `yaml:"schema"` // PostgreSQL schema
+	Kind              string        `yaml:"kind"`               // memory | sqlite | postgres
+	Path              string        `yaml:"path"`               // SQLite database path
+	DSN               string        `yaml:"dsn"`                // Postgres DSN
+	Schema            string        `yaml:"schema"`             // PostgreSQL schema
+	VisibilityTimeout time.Duration `yaml:"visibility_timeout"` // claim lease before re-delivery
 }
 
 // WebhookConfig declares push delivery for a single queue.

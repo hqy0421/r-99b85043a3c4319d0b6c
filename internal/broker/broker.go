@@ -25,7 +25,18 @@ type Options struct {
 	DurableDedupe    bool
 	AckBatchSize     int
 	AckFlushInterval time.Duration
+
+	// VisibilityTimeout bounds one delivery claim. A message that has not
+	// been acknowledged when this deadline passes becomes re-claimable by
+	// another worker, with a fresh lease identity, so a crashed or stalled
+	// worker cannot hold a message forever. Zero means a default is applied.
+	VisibilityTimeout time.Duration
 }
+
+// defaultVisibilityTimeout is the lease duration applied when Options does
+// not specify one. It is intentionally longer than any expected handler run
+// while still bounding crash recovery to a small number of seconds.
+const defaultVisibilityTimeout = 30 * time.Second
 
 // DedupeMetrics receives optional deduplication instrumentation from the
 // public metrics layer without coupling the broker to a metrics dependency.
@@ -41,6 +52,10 @@ type Broker struct {
 	store       storage.Storage
 	concurrency int
 	logger      logSink
+
+	// visibility is the lease duration stamped on every DequeueClaimed.
+	// Claims whose deadline passes are re-claimed under a new LeaseID.
+	visibility time.Duration
 
 	mwMu sync.RWMutex
 	mw   []Middleware
@@ -64,7 +79,7 @@ type Broker struct {
 	wg        sync.WaitGroup // counts dispatchers + workers; Shutdown waits on this
 
 	ackMu            sync.Mutex
-	pendingAcks      map[string][]string
+	pendingAcks      map[string][]storage.Claim
 	ackBatchSize     int
 	ackFlushInterval time.Duration
 	ackStop          chan struct{}
@@ -107,6 +122,9 @@ func New(opts Options) *Broker {
 	if opts.Concurrency <= 0 {
 		opts.Concurrency = 4
 	}
+	if opts.VisibilityTimeout <= 0 {
+		opts.VisibilityTimeout = defaultVisibilityTimeout
+	}
 	if opts.Logger == nil {
 		opts.Logger = slog.Default()
 	}
@@ -123,6 +141,7 @@ func New(opts Options) *Broker {
 	b := &Broker{
 		store:            opts.Storage,
 		concurrency:      opts.Concurrency,
+		visibility:       opts.VisibilityTimeout,
 		logger:           opts.Logger,
 		handlers:         make(map[string]*handler),
 		dispatchC:        make(map[string]chan struct{}),
@@ -142,7 +161,7 @@ func New(opts Options) *Broker {
 		ackFlushInterval: opts.AckFlushInterval,
 	}
 	if b.ackBatchSize > 0 && b.ackFlushInterval > 0 {
-		b.pendingAcks = make(map[string][]string)
+		b.pendingAcks = make(map[string][]storage.Claim)
 		b.ackStop = make(chan struct{})
 		b.ackWG.Add(1)
 		go b.ackLoop()
@@ -389,7 +408,7 @@ func (b *Broker) dispatch(queue string) {
 			continue
 		}
 
-		msgs, err := b.store.Dequeue(b.storeCtx(), queue, b.concurrency)
+		msgs, err := b.dequeue(b.storeCtx(), queue, b.concurrency)
 		if err != nil && !errors.Is(err, storage.ErrEmpty) {
 			b.logger.ErrorContext(b.storeCtx(), "shoebox: dequeue error",
 				slog.String("queue", queue), slog.Any("err", err))
@@ -501,9 +520,33 @@ func (b *Broker) inflightFor(queue string) *atomic.Int64 {
 	return ifq
 }
 
+// dequeue claims up to limit messages through the lease-aware path when the
+// backend supports it, stamping each claim with a fresh LeaseID and the
+// broker's visibility deadline. Backends without lease support fall back to
+// the plain Dequeue; their messages carry an empty LeaseID, which the
+// fence-aware operations treat as "no fencing" through the legacy methods.
+func (b *Broker) dequeue(ctx context.Context, queue string, limit int) ([]storage.Message, error) {
+	if leased, ok := b.store.(storage.VisibilityStorage); ok {
+		return leased.DequeueClaimed(ctx, queue, limit, b.visibility)
+	}
+	return b.store.Dequeue(ctx, queue, limit)
+}
+
+// leaseStore returns the lease-aware backend, or nil when the storage does
+// not implement VisibilityStorage.
+func (b *Broker) leaseStore() storage.VisibilityStorage {
+	leased, _ := b.store.(storage.VisibilityStorage)
+	return leased
+}
+
 // handleOne runs the registered handler for a single message. On success
 // the message is acked; on failure it is retried with backoff or moved
 // to the dead-letter shadow queue.
+//
+// Every terminal storage call carries the message's LeaseID. If the claim
+// timed out and another worker re-claimed the message, the call returns
+// storage.ErrLeaseLost and the stale outcome is dropped: the newer claim
+// keeps ownership, and an ack already delivered by another claim stands.
 func (b *Broker) handleOne(queue string, msg storage.Message) {
 	b.hMu.RLock()
 	h, ok := b.handlers[queue]
@@ -533,7 +576,12 @@ func (b *Broker) handleOne(queue string, msg storage.Message) {
 	defer cancel()
 	err := h.chain(ctx, msg)
 	if err == nil {
-		if err := b.ack(queue, msg.ID); err != nil {
+		if err := b.ack(queue, msg.ID, msg.LeaseID); err != nil {
+			if errors.Is(err, storage.ErrLeaseLost) {
+				b.logger.WarnContext(b.storeCtx(), "shoebox: stale ack skipped",
+					slog.String("queue", queue), slog.String("id", msg.ID))
+				return
+			}
 			b.logger.ErrorContext(b.storeCtx(), "shoebox: ack failed",
 				slog.String("queue", queue), slog.String("id", msg.ID), slog.Any("err", err))
 		}
@@ -554,19 +602,37 @@ func (b *Broker) handleOne(queue string, msg storage.Message) {
 
 	delay := h.opts.Backoff.Next(msg.Attempts)
 	msg.ScheduledAt = time.Now().Add(delay)
-	if err := b.store.Retry(b.storeCtx(), queue, msg, err); err != nil {
+	if err := b.retry(queue, msg, err); err != nil {
+		if errors.Is(err, storage.ErrLeaseLost) {
+			b.logger.WarnContext(b.storeCtx(), "shoebox: stale retry skipped",
+				slog.String("queue", queue), slog.String("id", msg.ID))
+			return
+		}
 		b.logger.ErrorContext(b.storeCtx(), "shoebox: retry transition failed",
 			slog.String("queue", queue), slog.String("id", msg.ID), slog.Any("err", err))
 	}
 }
 
-func (b *Broker) ack(queue, msgID string) error {
+// ack acknowledges one message. With a lease-aware backend the ack is fenced
+// by leaseID so a late confirmation cannot remove a newer claim; otherwise
+// it falls back to the plain storage Ack.
+//
+// When acknowledgement batching is enabled, fenced claims are buffered as
+// (message ID, LeaseID) pairs and flushed in one storage call; backends
+// without leases buffer plain IDs and flush through AckBatch.
+func (b *Broker) ack(queue, msgID, leaseID string) error {
 	if b.ackBatchSize <= 0 || b.ackStop == nil {
+		if leased := b.leaseStore(); leased != nil {
+			return leased.AckClaimed(b.storeCtx(), queue, msgID, leaseID)
+		}
 		return b.store.Ack(b.storeCtx(), queue, msgID)
 	}
 
 	b.ackMu.Lock()
-	b.pendingAcks[queue] = append(b.pendingAcks[queue], msgID)
+	b.pendingAcks[queue] = append(b.pendingAcks[queue], storage.Claim{
+		MessageID: msgID,
+		LeaseID:   leaseID,
+	})
 	flush := len(b.pendingAcks[queue]) >= b.ackBatchSize
 	b.ackMu.Unlock()
 	if flush {
@@ -594,20 +660,38 @@ func (b *Broker) ackLoop() {
 
 func (b *Broker) flushAcks(queue string) error {
 	b.ackMu.Lock()
-	ids := b.pendingAcks[queue]
+	claims := b.pendingAcks[queue]
 	delete(b.pendingAcks, queue)
 	b.ackMu.Unlock()
-	if len(ids) == 0 {
+	if len(claims) == 0 {
 		return nil
 	}
 
+	if leased := b.leaseStore(); leased != nil {
+		if err := leased.AckClaimedBatch(b.storeCtx(), queue, claims); err != nil {
+			b.requeueAcks(queue, claims)
+			return err
+		}
+		return nil
+	}
+
+	ids := make([]string, len(claims))
+	for i, claim := range claims {
+		ids[i] = claim.MessageID
+	}
 	if err := b.store.AckBatch(b.storeCtx(), queue, ids); err != nil {
-		b.ackMu.Lock()
-		b.pendingAcks[queue] = append(ids, b.pendingAcks[queue]...)
-		b.ackMu.Unlock()
+		b.requeueAcks(queue, claims)
 		return err
 	}
 	return nil
+}
+
+// requeueAcks returns buffered claims to the front of the queue after a
+// failed flush so the ack loop or the next size trigger retries them.
+func (b *Broker) requeueAcks(queue string, claims []storage.Claim) {
+	b.ackMu.Lock()
+	b.pendingAcks[queue] = append(claims, b.pendingAcks[queue]...)
+	b.ackMu.Unlock()
 }
 
 func (b *Broker) flushAllAcks() error {
@@ -646,13 +730,35 @@ func (b *Broker) handlerCtx(h *handler) (context.Context, context.CancelFunc) {
 	return context.WithCancel(parent)
 }
 
+// retry records a failed delivery for the message's current claim. A stale
+// claim (re-claimed after the lease expired) gets ErrLeaseLost so the
+// newer worker's delivery is not overwritten by the late failure.
+func (b *Broker) retry(queue string, msg storage.Message, handlerErr error) error {
+	if leased := b.leaseStore(); leased != nil {
+		return leased.RetryClaimed(b.storeCtx(), queue, msg, handlerErr)
+	}
+	return b.store.Retry(b.storeCtx(), queue, msg, handlerErr)
+}
+
 // toDeadLetter atomically moves a failed message to the {queue}.dlq shadow
 // queue and records the dead counter.
 func (b *Broker) toDeadLetter(queue string, msg storage.Message, handlerErr error) {
-	if err := b.store.DeadLetter(b.storeCtx(), queue, msg, handlerErr); err != nil {
-		b.logger.ErrorContext(b.storeCtx(), "shoebox: dead-letter transition failed",
-			slog.String("queue", queue), slog.String("id", msg.ID), slog.Any("err", err))
+	var err error
+	if leased := b.leaseStore(); leased != nil {
+		err = leased.DeadLetterClaimed(b.storeCtx(), queue, msg, handlerErr)
+	} else {
+		err = b.store.DeadLetter(b.storeCtx(), queue, msg, handlerErr)
 	}
+	if err == nil {
+		return
+	}
+	if errors.Is(err, storage.ErrLeaseLost) {
+		b.logger.WarnContext(b.storeCtx(), "shoebox: stale dead-letter skipped",
+			slog.String("queue", queue), slog.String("id", msg.ID))
+		return
+	}
+	b.logger.ErrorContext(b.storeCtx(), "shoebox: dead-letter transition failed",
+		slog.String("queue", queue), slog.String("id", msg.ID), slog.Any("err", err))
 }
 
 // Shutdown drains the queues and stops the dispatchers.
@@ -758,6 +864,11 @@ func (b *Broker) Stats(ctx context.Context, queue string) (storage.QueueStats, e
 // can pass it to packages like dlq without a separate handle.
 func (b *Broker) Store() storage.Storage {
 	return b.store
+}
+
+// Visibility returns the claim lease duration stamped on every dequeue.
+func (b *Broker) Visibility() time.Duration {
+	return b.visibility
 }
 
 // --- Pause / Resume / Drain (ADR 0006 §Pause & drain) ---

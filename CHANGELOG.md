@@ -15,6 +15,15 @@ and releases follow [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- Visibility-timeout leases: dequeued messages carry a `LeaseID` fencing
+  token and a persisted claim deadline. Timed-out claims are re-claimed with a
+  new identity, stale acknowledgements, retries, and dead-letter transitions
+  are rejected with `storage.ErrLeaseLost`, and Memory, SQLite, and PostgreSQL
+  share the same expiry boundary. The timeout is configurable via
+  `Options.VisibilityTimeout` (default 30s), the `--visibility-timeout`
+  server flag, and `storage.visibility_timeout` in the server config. The
+  pull API requires the lease on acknowledgement and returns `409 Conflict`
+  on a missing or stale token.
 - Release automation for server binaries and the container image.
 
 ## [0.1.6] - 2026-08-18

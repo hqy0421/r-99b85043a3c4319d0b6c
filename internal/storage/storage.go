@@ -38,6 +38,22 @@ type Message struct {
 	// DeadAt is set when the message is moved to the dead-letter queue; it
 	// records the time of dead-lettering. Zero for live messages.
 	DeadAt time.Time
+
+	// LeaseID is the fencing token of the current delivery claim. It is
+	// assigned on every Dequeue — including every re-claim of a message
+	// whose previous claim timed out — and is empty for a pending message
+	// that has never been claimed. Ack, Retry, and DeadLetter only affect a
+	// row whose LeaseID matches the claimant's, so a late confirmation from
+	// an earlier claim can never overwrite a newer claim or a completed
+	// message.
+	LeaseID string
+
+	// LeaseExpiresAt is the absolute deadline of the current delivery claim.
+	// A 'processing' message whose LeaseExpiresAt is in the past is eligible
+	// for re-claim by another worker without any restart. The deadline is
+	// stored, not computed from a timeout duration, so a restart keeps
+	// judging expiry against the original deadline.
+	LeaseExpiresAt time.Time
 }
 
 // Schedule is a persistent periodic enqueue definition.
@@ -70,6 +86,10 @@ func deadLetterMessage(queue string, msg Message, err error, now time.Time) Mess
 	if err != nil {
 		msg.Error = err.Error()
 	}
+	// A DLQ row is terminal, not a claim: clear any lease so a later
+	// Replay starts from an unclaimed pending message.
+	msg.LeaseID = ""
+	msg.LeaseExpiresAt = time.Time{}
 	return msg
 }
 
@@ -78,6 +98,10 @@ func replayMessage(queue string, msg Message, now time.Time) Message {
 	msg.ScheduledAt = now
 	msg.Error = ""
 	msg.DeadAt = time.Time{}
+	// Replay hands the message out as a fresh pending message; its next
+	// Dequeue assigns a new lease.
+	msg.LeaseID = ""
+	msg.LeaseExpiresAt = time.Time{}
 	return msg
 }
 
@@ -116,6 +140,44 @@ type QueueStats struct {
 
 // ErrEmpty is returned by Dequeue when no messages are available.
 var ErrEmpty = errors.New("shoebox/storage: queue empty")
+
+// ErrLeaseLost is returned by lease-aware Ack, Retry, and DeadLetter calls
+// when the caller's claim is no longer current: the message was re-claimed
+// after the lease expired, or it was already completed by another claim. It
+// is a normal at-least-once outcome, not a storage failure — the broker logs
+// it as a stale-claim skip rather than treating it as an error.
+var ErrLeaseLost = errors.New("shoebox/storage: lease no longer held")
+
+// Claim pairs a message ID with the LeaseID of the delivery claim that is
+// acting on it. AckBatch takes claims so each acknowledgement is fenced
+// individually.
+type Claim struct {
+	MessageID string
+	LeaseID   string
+}
+
+// VisibilityStorage is the lease-aware extension of Storage. Every built-in
+// backend implements it; callers that need crash-safe hand-off (the broker,
+// the pull API) type-assert to it and fall back to the plain methods when a
+// backend does not provide leases.
+//
+// DequeueClaimed behaves like Dequeue but stamps every returned message with
+// a fresh LeaseID and a LeaseExpiresAt of now+visibilityTimeout. Pending
+// messages and processing messages whose lease has expired are both eligible;
+// an expired processing message keeps its identity and payload but receives a
+// new LeaseID, so a late ack from the previous claimant cannot touch the new
+// claim.
+//
+// The lease-aware Ack, Retry, and DeadLetter match both the message ID and
+// the claimant's LeaseID. A mismatched or completed claim returns ErrLeaseLost.
+type VisibilityStorage interface {
+	Storage
+	DequeueClaimed(ctx context.Context, queue string, limit int, visibilityTimeout time.Duration) ([]Message, error)
+	AckClaimed(ctx context.Context, queue, msgID, leaseID string) error
+	AckClaimedBatch(ctx context.Context, queue string, claims []Claim) error
+	RetryClaimed(ctx context.Context, queue string, m Message, err error) error
+	DeadLetterClaimed(ctx context.Context, queue string, m Message, err error) error
+}
 
 // Storage is the interface every backend implements.
 //
@@ -159,4 +221,12 @@ func NewMessageID() string {
 		return "ts-" + hex.EncodeToString([]byte(strconv.FormatInt(now, 10)))
 	}
 	return hex.EncodeToString(b[:])
+}
+
+// NewLeaseID returns a fresh random fencing token for one delivery claim.
+// Re-claiming a timed-out message always produces a different token from the
+// previous claim, which is what makes stale acks unable to overwrite the new
+// claim. It uses the same generator as NewMessageID.
+func NewLeaseID() string {
+	return NewMessageID()
 }

@@ -16,6 +16,7 @@ storage:
   path: "shoebox.db"       # sqlite only
   dsn: ""                  # postgres only, e.g. "host=localhost port=5432 dbname=shoebox user=postgres password=secret sslmode=disable"
   schema: "public"         # postgres only; created automatically if absent
+  visibility_timeout: 30s  # claim lease; an unacked message past this deadline is re-claimed with a new lease identity
 
 # Per-queue webhook targets. A queue listed here is push-delivered by the
 # broker: each message is POSTed to the URL, and non-2xx triggers normal

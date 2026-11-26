@@ -699,7 +699,7 @@ func TestPostgres_MigrationUpgradeFromV1(t *testing.T) {
 func TestPostgres_MigrationFreshDatabase(t *testing.T) {
 	s := newTestPostgres(t)
 	ctx := context.Background()
-	assertPostgresMigrationVersions(t, s, 1, 2, 3, 4, 5)
+	assertPostgresMigrationVersions(t, s, 1, 2, 3, 4, 5, 6)
 
 	mustPgEnqueue(t, s, "q", Message{ID: "fresh", Payload: []byte("fresh")})
 	if got, err := s.Dequeue(ctx, "q", 1); err != nil {
@@ -746,7 +746,7 @@ func TestPostgres_MigrationUpgradeFromV2(t *testing.T) {
 		t.Fatalf("NewPostgres on v2 database: %v", err)
 	}
 	t.Cleanup(func() { _ = s.Close() })
-	assertPostgresMigrationVersions(t, s, 2, 3, 4, 5)
+	assertPostgresMigrationVersions(t, s, 2, 3, 4, 5, 6)
 
 	mustPgEnqueue(t, s, "q", Message{ID: "v2", Payload: []byte("v2")})
 	got, err := s.Dequeue(ctx, "q", 1)
@@ -804,7 +804,7 @@ func TestPostgres_MigrationRepairFromPoisonedVersion(t *testing.T) {
 		t.Fatalf("NewPostgres on poisoned database: %v", err)
 	}
 	t.Cleanup(func() { _ = s.Close() })
-	assertPostgresMigrationVersions(t, s, 4, 5)
+	assertPostgresMigrationVersions(t, s, 4, 5, 6)
 
 	mustPgEnqueue(t, s, "q", Message{ID: "repaired", Payload: []byte("repaired")})
 	got, err := s.Dequeue(ctx, "q", 1)

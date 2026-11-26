@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/adexaja/shoebox/migrations"
 )
 
 // newTestSQLite opens an in-memory SQLite database for testing. Using
@@ -338,35 +340,49 @@ func TestSQLite_CrashRecovery(t *testing.T) {
 
 	mustEnqueueStore(t, s1, "q", Message{ID: "survivor", Payload: []byte("data")})
 
-	// Dequeue but DON'T ack — simulates a crash mid-handler.
-	msgs, err := s1.Dequeue(ctx, "q", 1)
+	// Dequeue but DON'T ack — simulates a crash mid-handler. A short
+	// visibility timeout makes the original claim expire shortly after the
+	// crash.
+	first, err := s1.DequeueClaimed(ctx, "q", 1, 50*time.Millisecond)
 	if err != nil {
-		t.Fatalf("Dequeue s1: %v", err)
+		t.Fatalf("DequeueClaimed s1: %v", err)
 	}
-	if len(msgs) != 1 || msgs[0].ID != "survivor" {
-		t.Fatalf("got %v, want [survivor]", ids(msgs))
+	if len(first) != 1 || first[0].ID != "survivor" || first[0].LeaseID == "" {
+		t.Fatalf("got %v, want one leased [survivor]", ids(first))
 	}
 
 	// "Crash": close without acking.
 	_ = s1.Close()
 
-	// Reopen — Reclaim should transition 'processing' → 'pending'.
+	// Reopen. The processing row keeps its persisted lease_expires_at — the
+	// restart does not reset it — so before the deadline the message is not
+	// re-delivered.
 	s2, err := NewSQLite(ctx, path)
 	if err != nil {
 		t.Fatalf("NewSQLite s2: %v", err)
 	}
 	defer func() { _ = s2.Close() }()
 
-	// The message must be redelivered.
-	msgs2, err := s2.Dequeue(ctx, "q", 1)
+	if _, err := s2.DequeueClaimed(ctx, "q", 1, 50*time.Millisecond); !errors.Is(err, ErrEmpty) {
+		t.Fatalf("dequeue before lease expiry = %v, want ErrEmpty", err)
+	}
+
+	// Once the original deadline passes, another worker can re-claim the
+	// message without any explicit reclaim.
+	time.Sleep(60 * time.Millisecond)
+	msgs2, err := s2.DequeueClaimed(ctx, "q", 1, time.Minute)
 	if err != nil {
-		t.Fatalf("Dequeue s2: %v", err)
+		t.Fatalf("DequeueClaimed s2 after expiry: %v", err)
 	}
 	if len(msgs2) != 1 || msgs2[0].ID != "survivor" {
 		t.Fatalf("after recovery, got %v, want [survivor]", ids(msgs2))
 	}
 	if string(msgs2[0].Payload) != "data" {
 		t.Errorf("payload = %q, want %q", string(msgs2[0].Payload), "data")
+	}
+	if msgs2[0].LeaseID == "" || msgs2[0].LeaseID == first[0].LeaseID {
+		t.Fatalf("re-claim lease = %q, want a fresh token different from %q",
+			msgs2[0].LeaseID, first[0].LeaseID)
 	}
 }
 
@@ -585,8 +601,12 @@ func TestSQLite_MigrationUpgradeFromV1(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read user_version: %v", err)
 	}
-	if version != 4 {
-		t.Fatalf("user_version after upgrade = %d, want 4", version)
+	latest, err := migrations.Latest("sqlite")
+	if err != nil {
+		t.Fatalf("migrations.Latest: %v", err)
+	}
+	if version != latest {
+		t.Fatalf("user_version after upgrade = %d, want %d", version, latest)
 	}
 }
 
